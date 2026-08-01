@@ -105,6 +105,17 @@ class CatBoostModelData:
         return int(nan_mode.lower() == "min")
 
 
+def previous_float32(value: np.float32) -> np.float32:
+    """Get the largest float32 that is strictly smaller than 'value'"""
+    return np.nextafter(value, np.float32(-np.inf))
+
+
+def round_down_to_float32(value: float) -> np.float32:
+    """Get the largest float32 that is not larger than 'value'"""
+    rounded = np.float32(value)
+    return rounded if float(rounded) <= value else previous_float32(rounded)
+
+
 class Node:
     """Helper class holding Tree Node information"""
 
@@ -115,6 +126,7 @@ class Node:
         default_left: bool,
         feature: int,
         value: float,
+        equal_goes_left: bool,
         n_children: int = 0,
         left_child: "Optional[Node]" = None,
         right_child: "Optional[Node]" = None,
@@ -126,6 +138,7 @@ class Node:
         self.default_left = default_left
         self.__feature = feature
         self.value = value
+        self.equal_goes_left = equal_goes_left
         self.n_children = n_children
         self.left_child = left_child
         self.right_child = right_child
@@ -159,6 +172,7 @@ class Node:
             default_left=default_left,
             feature=feature,
             value=input_dict["leaf"] if is_leaf else input_dict["split_condition"],
+            equal_goes_left=False,
             n_children=n_children,
             left_child=left_child,
             right_child=right_child,
@@ -193,6 +207,7 @@ class Node:
             default_left=tree.get("default_left", 0),
             feature=tree.get("split_feature"),
             value=value,
+            equal_goes_left=True,
             n_children=n_children,
             left_child=left_child,
             right_child=right_child,
@@ -219,16 +234,19 @@ class Node:
             right_child = None
 
         value = this_node["leaf_value"] if is_leaf else this_node["threshold"]
+        equal_goes_left = False
         if not is_leaf:
             comp = this_node["comparison_op"]
-            if comp == "<=":
-                value = float(np.nextafter(value, np.inf))
-            elif comp in [">", ">="]:
+            if comp in ("<", "<="):
+                equal_goes_left = comp == "<="
+            elif comp in (">", ">="):
+                # oneDAL always keeps the lower values in the left child, so
+                # the children are swapped: 'x > t' becomes 'x <= t' and
+                # 'x >= t' becomes 'x < t'
                 left_child, right_child = right_child, left_child
                 default_left = not default_left
-                if comp == ">":
-                    value = float(np.nextafter(value, -np.inf))
-            elif comp != "<":
+                equal_goes_left = comp == ">"
+            else:
                 raise TypeError(
                     f"Model to convert contains unsupported split type: {comp}."
                 )
@@ -239,14 +257,25 @@ class Node:
             default_left=default_left,
             feature=this_node.get("split_feature_id"),
             value=value,
+            equal_goes_left=equal_goes_left,
             n_children=n_children,
             left_child=left_child,
             right_child=right_child,
         )
 
-    def get_value_closest_float_downward(self) -> np.float64:
-        """Get the closest exact fp value smaller than self.value"""
-        return np.nextafter(np.single(self.value), np.single(-np.inf))
+    def get_split_threshold(self) -> np.float32:
+        """Get the float32 threshold for oneDAL's 'x <= threshold goes left' rule
+
+        Float32 observations end up in the same child as in the model being
+        converted; float64 ones that fall between the returned threshold and
+        'self.value' do not.
+        """
+        if self.equal_goes_left:
+            return round_down_to_float32(self.value)
+        # XGBoost, the only source of exclusive splits, holds float32 thresholds
+        # but dumps them as longer decimals - 0.99734545 comes back as
+        # '0.997345448' - so the value is rounded back before stepping below it
+        return previous_float32(np.float32(self.value))
 
     def get_children(self) -> "Optional[Tuple[Node, Node]]":
         if not self.left_child or not self.right_child:
@@ -433,7 +462,7 @@ def get_gbt_model_from_tree_list(
         parent_id = mb.add_split(
             tree_id=tree_id,
             feature_index=root_node.feature,
-            feature_value=root_node.get_value_closest_float_downward(),
+            feature_value=root_node.get_split_threshold(),
             cover=root_node.cover,
             default_left=root_node.default_left,
         )
@@ -464,7 +493,7 @@ def get_gbt_model_from_tree_list(
                 parent_id = mb.add_split(
                     tree_id=tree_id,
                     feature_index=node.feature,
-                    feature_value=node.get_value_closest_float_downward(),
+                    feature_value=node.get_split_threshold(),
                     cover=node.cover,
                     default_left=node.default_left,
                     parent_id=node.parent_id,
