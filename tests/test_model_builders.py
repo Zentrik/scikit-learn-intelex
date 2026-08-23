@@ -1660,9 +1660,8 @@ def test_split_threshold(value, split_op, expected):
     assert float(node.get_split_threshold()) == expected
 
 
-# LightGBM's own predictor drops feature values whose magnitude does not
-# exceed this before comparing them against a threshold, so observations
-# sitting on a split at +-this value are not routed by the split at all
+# LightGBM's predictor zeroes feature values this small before comparing them,
+# so observations sitting on a split at +-this value are not routed by it
 _LGB_ZERO_THRESHOLD = float(np.float32(1e-35))
 
 
@@ -1673,19 +1672,17 @@ _LGB_ZERO_THRESHOLD = float(np.float32(1e-35))
         ("xgboost", True),
         ("lightgbm", False),
         ("lightgbm", True),
-        # scikit-learn models are only convertible through treelite, and their
-        # thresholds are bin midpoints that no float32 represents exactly.
-        # Forests take a different conversion path than boosters, as they
-        # average their trees instead of adding them up.
+        # only convertible through treelite, and their thresholds are bin
+        # midpoints that no float32 represents exactly; forests take a separate
+        # path from boosters, averaging their trees rather than summing them
         ("sklearn", True),
         ("sklearn_forest", True),
     ],
 )
 def test_predictions_of_observations_on_split_thresholds(booster_kind, from_treelite):
-    # Observations whose feature value is exactly equal to a split threshold are
-    # the only ones that can tell '<' apart from '<=', so they are what catches
-    # an off-by-one-ulp threshold conversion. Random data almost never lands on a
-    # threshold, hence this builds the observations from the thresholds instead.
+    # Only observations sitting exactly on a threshold can tell '<' from '<=',
+    # and random data almost never lands on one, so build them from the
+    # thresholds instead.
     X, y = make_regression(n_samples=200, n_features=5, random_state=42)
     if booster_kind == "xgboost":
         booster = xgb.train(
@@ -1717,17 +1714,15 @@ def test_predictions_of_observations_on_split_thresholds(booster_kind, from_tree
         if "threshold" in node and abs(node["threshold"]) > _LGB_ZERO_THRESHOLD
     ]
     assert len(splits) > 20, "model to test has too few splits to be meaningful"
-    # XGBoost holds its thresholds as float32 already, so its conversion cannot
-    # round them; for everything else a model whose thresholds all happen to be
-    # representable would quietly stop testing anything
+    # XGBoost's thresholds are already float32, so rounding cannot apply; for
+    # the rest, an all-representable model would quietly stop testing anything
     if booster_kind != "xgboost":
         assert any(
             float(np.float32(threshold)) != threshold for _, threshold in splits
         ), "no threshold of the model to test exercises rounding to float32"
 
-    # one observation per split, sitting exactly on that split's threshold, on
-    # top of an average observation so that they reach varied parts of the
-    # trees instead of all taking the same path down
+    # one observation per split, on top of an average one so that they reach
+    # varied parts of the trees instead of all taking the same path down
     X_test = np.tile(X.mean(axis=0), (len(splits), 1))
     for row, (feature, threshold) in enumerate(splits):
         X_test[row, feature] = np.float32(threshold)
@@ -2003,15 +1998,14 @@ def test_treelite_uncommon(opname, threshold):
             [hi, 5.0, -5.0],
             [hi, 5.0, -2.0],
             [hi, 5.0, 1.0],
-            # observations sitting exactly on each threshold, which are the
-            # only ones that tell the strict operators from the inclusive ones
+            # sitting exactly on each threshold, the only observations that
+            # tell the strict operators from the inclusive ones
             [on, 0.0, -3.0],
             [on, 0.0, 1.0],
             [lo, 0.0, -3.0],
             [hi, 0.0, -3.0],
-            # observations that take a default branch, which is the other half
-            # of what swapping the children of a '>' or '>=' split has to get
-            # right, as the default direction gets swapped along with them
+            # taking a default branch, whose direction is swapped along with
+            # the children of a '>' or '>=' split
             [np.nan, 0.0, -5.0],
             [np.nan, 0.0, 1.0],
             [lo, 0.0, np.nan],
