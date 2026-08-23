@@ -1638,10 +1638,8 @@ def test_model_from_booster():
         (0.1, "<=", 0.09999999403953552),
         (-12345.6789, "<", -12345.6796875),
         (-12345.6789, "<=", -12345.6796875),
-        # when it goes down, the rounded threshold already sits below the one it
-        # came from, so it excludes exactly what the model excludes and both
-        # splits keep it; stepping down again would push observations that
-        # belong on the left over to the right
+        # when it goes down, the rounded threshold already excludes what the
+        # model excludes, so both splits keep it instead of stepping again
         (-0.1, "<", -0.10000000149011612),
         (-0.1, "<=", -0.10000000149011612),
         (12345.6789, "<", 12345.6787109375),
@@ -1929,9 +1927,8 @@ def test_treelite_unsupported():
 # These aren't typically produced by the main libraries targeted by
 # treelite, but can still be specified to be like this when constructing
 # a model through their model builder.
-# 12345.6789 is not representable as a float32 and rounds down to one, which
-# is what tells a correctly converted exclusive split from one that steps a
-# further ulp down; 5.0 is representable and reproduces the plain case
+# 5.0 is exactly representable as a float32; 12345.6789 is not and rounds down
+# to one, which is what catches an exclusive split converted an ulp too low
 @pytest.mark.parametrize("threshold", [5.0, 12345.6789])
 @pytest.mark.parametrize("opname", [">", ">=", "<", "<="])
 def test_treelite_uncommon(opname, threshold):
@@ -1989,9 +1986,8 @@ def test_treelite_uncommon(opname, threshold):
     tl_model = builder.commit()
     d4p_model = d4p.mb.convert_model(tl_model)
 
-    # observations for the first feature, expressed relative to its threshold;
-    # the one sitting on the split is the float32 of it, as a float64 nearer
-    # than a float32 step is outside what the conversion promises
+    # 'on' is the float32 of the threshold rather than the threshold itself: a
+    # float64 closer than a float32 step is outside what the conversion promises
     lo, on, hi = threshold - 5.0, float(np.float32(threshold)), threshold + 5.0
     X = np.array(
         [

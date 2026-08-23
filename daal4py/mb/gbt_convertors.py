@@ -158,9 +158,8 @@ class Node:
         if is_leaf:
             value = input_dict["leaf"]
         else:
-            # XGBoost holds float32 thresholds but dumps them as longer decimals
-            # - 0.99734545 comes back as '0.997345448' - so the number it really
-            # splits on is the float32 that the dumped decimal rounds to
+            # XGBoost dumps its float32 thresholds as longer decimals, e.g.
+            # 0.99734545 as '0.997345448', so round back to the one it splits on
             value = float(np.float32(input_dict["split_condition"]))
         return Node(
             cover=input_dict["cover"],
@@ -195,8 +194,7 @@ class Node:
 
         is_leaf = "leaf_value" in tree
         if not is_leaf and tree.get("decision_type", "<=") != "<=":
-            # numeric splits are dumped as '<='; '==' marks a categorical split,
-            # whose threshold is a '0||1||2' category list rather than a number
+            # '==' marks a categorical split, whose threshold is a category list
             raise TypeError("Models with categorical features are not supported.")
 
         # get cover and value for leaf nodes or internal nodes
@@ -239,9 +237,8 @@ class Node:
         if not is_leaf:
             split_op = this_node["comparison_op"]
             if split_op in (">", ">="):
-                # oneDAL always keeps the lower values in the left child, so the
-                # children are swapped, which turns 'x > t' into 'x <= t' and
-                # 'x >= t' into 'x < t'
+                # oneDAL always keeps the lower values in the left child, so
+                # swap the children and rewrite the split to match
                 left_child, right_child = right_child, left_child
                 default_left = not default_left
                 split_op = "<=" if split_op == ">" else "<"
@@ -265,16 +262,14 @@ class Node:
     def get_split_threshold(self) -> np.float32:
         """Get the float32 threshold this node's split becomes in oneDAL
 
-        Every source is normalised to send an observation left when 'x < value'
-        or 'x <= value' holds, whichever 'split_op' names, while oneDAL sends it
-        left when 'x <= threshold'. The threshold returned here is the largest
-        float32 that puts every float32 observation on the side this node's own
-        comparison puts it; float64 observations lying between that threshold
-        and 'value' are not preserved by the conversion.
+        The node sends an observation left when 'x < value' or 'x <= value'
+        holds, whichever 'split_op' names; oneDAL sends it left when
+        'x <= threshold'. This returns the largest float32 that agrees with the
+        node for every float32 observation - float64 ones lying between it and
+        'value' do not survive the conversion.
         """
-        # the rounded value can stand in for the threshold only while it still
-        # falls on the left of this node's own split - otherwise it would take
-        # in observations that the split sends right
+        # a rounded value that no longer goes left would take in observations
+        # that the split sends right
         rounded = np.float32(self.value)
         rounded_goes_left = (
             float(rounded) <= self.value
