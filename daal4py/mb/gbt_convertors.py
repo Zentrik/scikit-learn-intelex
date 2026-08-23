@@ -18,6 +18,7 @@ import json
 import warnings
 from collections import deque
 from copy import deepcopy
+from functools import lru_cache
 from tempfile import NamedTemporaryFile
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
@@ -105,19 +106,45 @@ class CatBoostModelData:
         return int(nan_mode.lower() == "min")
 
 
-def previous_float32(value: np.float32) -> np.float32:
-    """Get the largest float32 that is strictly smaller than 'value'"""
-    return np.nextafter(value, np.float32(-np.inf))
+_NEG_INF_FLOAT32 = np.float32(-np.inf)
 
 
-def round_down_to_float32(value: float) -> np.float32:
-    """Get the largest float32 that is not larger than 'value'"""
+@lru_cache(maxsize=4096)
+def _get_split_threshold(value: float, equal_goes_left: bool) -> np.float32:
+    """Get the float32 threshold for oneDAL's 'x <= threshold goes left' rule
+
+    This is the largest float32 not above 'value' for an inclusive split, and
+    the largest one strictly below it for an exclusive one, so that every
+    float32 observation reaches the child the source model sends it to. Float64
+    observations falling between the returned threshold and 'value' do not.
+    A forest's splits repeat thresholds heavily, hence the cache.
+    """
+    # rounding to float32 can go either way, and a rounded threshold that landed
+    # on the wrong side of 'value' would take in observations that the split it
+    # came from routes the other way, so it is usable as it is only while it
+    # still satisfies that split's own comparison against 'value'
     rounded = np.float32(value)
-    return rounded if float(rounded) <= value else previous_float32(rounded)
+    if float(rounded) <= value if equal_goes_left else float(rounded) < value:
+        return rounded
+    return np.nextafter(rounded, _NEG_INF_FLOAT32)
 
 
 class Node:
     """Helper class holding Tree Node information"""
+
+    __slots__ = (
+        "cover",
+        "is_leaf",
+        "default_left",
+        "__feature",
+        "value",
+        "equal_goes_left",
+        "n_children",
+        "left_child",
+        "right_child",
+        "parent_id",
+        "position",
+    )
 
     def __init__(
         self,
@@ -166,12 +193,21 @@ class Node:
         feature = input_dict.get("split")
         if feature:
             feature = feature_names_to_indices[feature]
+        if is_leaf:
+            value = input_dict["leaf"]
+        else:
+            # XGBoost holds float32 thresholds but dumps them as longer decimals
+            # - 0.99734545 comes back as '0.997345448' - so the number it really
+            # splits on is the float32 that the dumped decimal rounds to
+            value = float(np.float32(input_dict["split_condition"]))
         return Node(
             cover=input_dict["cover"],
             is_leaf=is_leaf,
             default_left=default_left,
             feature=feature,
-            value=input_dict["leaf"] if is_leaf else input_dict["split_condition"],
+            value=value,
+            # XGBoost splits on 'x < threshold', so an observation equal to the
+            # threshold goes right
             equal_goes_left=False,
             n_children=n_children,
             left_child=left_child,
@@ -198,6 +234,11 @@ class Node:
             right_child = None
 
         is_leaf = "leaf_value" in tree
+        if not is_leaf and tree.get("decision_type", "<=") != "<=":
+            # numeric splits are dumped as '<='; '==' marks a categorical split,
+            # whose threshold is a '0||1||2' category list rather than a number
+            raise TypeError("Models with categorical features are not supported.")
+
         # get cover and value for leaf nodes or internal nodes
         cover = tree.get("leaf_count", 0) or tree.get("internal_count", 0)
         value = tree.get("leaf_value", 0) or tree.get("threshold", 0)
@@ -207,6 +248,8 @@ class Node:
             default_left=tree.get("default_left", 0),
             feature=tree.get("split_feature"),
             value=value,
+            # every split reaching here compares with '<=', as checked above,
+            # so an observation equal to the threshold goes left
             equal_goes_left=True,
             n_children=n_children,
             left_child=left_child,
@@ -237,19 +280,18 @@ class Node:
         equal_goes_left = False
         if not is_leaf:
             comp = this_node["comparison_op"]
-            if comp in ("<", "<="):
-                equal_goes_left = comp == "<="
-            elif comp in (">", ">="):
-                # oneDAL always keeps the lower values in the left child, so
-                # the children are swapped: 'x > t' becomes 'x <= t' and
-                # 'x >= t' becomes 'x < t'
+            if comp in (">", ">="):
+                # oneDAL always keeps the lower values in the left child, so the
+                # children are swapped, which turns 'x > t' into 'x <= t' and
+                # 'x >= t' into 'x < t'
                 left_child, right_child = right_child, left_child
                 default_left = not default_left
-                equal_goes_left = comp == ">"
-            else:
+                comp = "<=" if comp == ">" else "<"
+            elif comp not in ("<", "<="):
                 raise TypeError(
                     f"Model to convert contains unsupported split type: {comp}."
                 )
+            equal_goes_left = comp == "<="
 
         return Node(
             cover=this_node.get("sum_hess", 0.0),
@@ -264,18 +306,8 @@ class Node:
         )
 
     def get_split_threshold(self) -> np.float32:
-        """Get the float32 threshold for oneDAL's 'x <= threshold goes left' rule
-
-        Float32 observations end up in the same child as in the model being
-        converted; float64 ones that fall between the returned threshold and
-        'self.value' do not.
-        """
-        if self.equal_goes_left:
-            return round_down_to_float32(self.value)
-        # XGBoost, the only source of exclusive splits, holds float32 thresholds
-        # but dumps them as longer decimals - 0.99734545 comes back as
-        # '0.997345448' - so the value is rounded back before stepping below it
-        return previous_float32(np.float32(self.value))
+        """Get the float32 threshold this node's split becomes in oneDAL"""
+        return _get_split_threshold(self.value, self.equal_goes_left)
 
     def get_children(self) -> "Optional[Tuple[Node, Node]]":
         if not self.left_child or not self.right_child:

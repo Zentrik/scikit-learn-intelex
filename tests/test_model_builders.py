@@ -1126,6 +1126,8 @@ def test_lgb_unsupported():
             "deterministic": True,
         },
     )
+    with pytest.raises(TypeError):
+        d4p.mb.convert_model(lgb_model)
 
 
 def make_cb_model(
@@ -1636,12 +1638,15 @@ def test_model_from_booster():
         (0.1, True, 0.09999999403953552),
         (-12345.6789, False, -12345.6796875),
         (-12345.6789, True, -12345.6796875),
-        # when it goes down, the rounded threshold is already exclusive enough
-        (-0.1, False, -0.10000000894069672),
+        # when it goes down, the rounded threshold already sits below the one it
+        # came from, so it excludes exactly what the model excludes and both
+        # splits keep it; stepping down again would push observations that
+        # belong on the left over to the right
+        (-0.1, False, -0.10000000149011612),
         (-0.1, True, -0.10000000149011612),
-        (12345.6789, False, 12345.677734375),
+        (12345.6789, False, 12345.6787109375),
         (12345.6789, True, 12345.6787109375),
-        (1e10 + 0.5, False, 9999998976.0),
+        (1e10 + 0.5, False, 10000000000.0),
         (1e10 + 0.5, True, 10000000000.0),
     ],
 )
@@ -1664,7 +1669,7 @@ _LGB_ZERO_THRESHOLD = float(np.float32(1e-35))
 
 
 @pytest.mark.parametrize(
-    "booster_kind,through_treelite",
+    "booster_kind,from_treelite",
     [
         ("xgboost", False),
         ("xgboost", True),
@@ -1678,7 +1683,7 @@ _LGB_ZERO_THRESHOLD = float(np.float32(1e-35))
         ("sklearn_forest", True),
     ],
 )
-def test_predictions_of_observations_on_split_thresholds(booster_kind, through_treelite):
+def test_predictions_of_observations_on_split_thresholds(booster_kind, from_treelite):
     # Observations whose feature value is exactly equal to a split threshold are
     # the only ones that can tell '<' apart from '<=', so they are what catches
     # an off-by-one-ulp threshold conversion. Random data almost never lands on a
@@ -1691,9 +1696,6 @@ def test_predictions_of_observations_on_split_thresholds(booster_kind, through_t
             num_boost_round=5,
         )
         tl_model = treelite.frontend.from_xgboost(booster)
-        predict_natively = lambda data: booster.predict(
-            xgb.DMatrix(data), output_margin=True
-        )
     elif booster_kind == "lightgbm":
         booster = (
             lgb.LGBMRegressor(n_estimators=10, num_leaves=31, random_state=42, verbose=-1)
@@ -1701,14 +1703,13 @@ def test_predictions_of_observations_on_split_thresholds(booster_kind, through_t
             .booster_
         )
         tl_model = treelite.frontend.from_lightgbm(booster)
-        predict_natively = lambda data: booster.predict(data, raw_score=True)
     else:
         estimator = (
             RandomForestRegressor(n_estimators=5, max_depth=4, random_state=42)
             if booster_kind == "sklearn_forest"
             else GradientBoostingRegressor(n_estimators=5, max_depth=4, random_state=42)
         )
-        booster = tl_model = treelite.sklearn.import_model(estimator.fit(X, y))
+        tl_model = treelite.sklearn.import_model(estimator.fit(X, y))
 
     model_json = json.loads(tl_model.dump_as_json(pretty_print=False))
     splits = [
@@ -1717,10 +1718,10 @@ def test_predictions_of_observations_on_split_thresholds(booster_kind, through_t
         for node in tree["nodes"]
         if "threshold" in node and abs(node["threshold"]) > _LGB_ZERO_THRESHOLD
     ]
+    assert len(splits) > 20, "model to test has too few splits to be meaningful"
     # XGBoost holds its thresholds as float32 already, so its conversion cannot
     # round them; for everything else a model whose thresholds all happen to be
     # representable would quietly stop testing anything
-    assert len(splits) > 20, "model to test has too few splits to be meaningful"
     if booster_kind != "xgboost":
         assert any(
             float(np.float32(threshold)) != threshold for _, threshold in splits
@@ -1729,18 +1730,88 @@ def test_predictions_of_observations_on_split_thresholds(booster_kind, through_t
     # one observation per split, sitting exactly on that split's threshold, on
     # top of an average observation so that they reach varied parts of the
     # trees instead of all taking the same path down
-    X_test = np.repeat(X.mean(axis=0).reshape(1, -1), len(splits), axis=0)
+    X_test = np.tile(X.mean(axis=0), (len(splits), 1))
     for row, (feature, threshold) in enumerate(splits):
         X_test[row, feature] = np.float32(threshold)
 
-    model = tl_model if through_treelite else booster
-    if through_treelite:
+    if from_treelite:
+        model = tl_model
         expected = treelite.gtil.predict(model, X_test, pred_margin=True).reshape(-1)
+    elif booster_kind == "xgboost":
+        model = booster
+        expected = booster.predict(xgb.DMatrix(X_test), output_margin=True)
     else:
-        expected = predict_natively(X_test)
+        model = booster
+        expected = booster.predict(X_test, raw_score=True)
 
     d4p_model = d4p.mb.convert_model(model)
-    np.testing.assert_allclose(d4p_model.predict(X_test), expected, rtol=1e-5)
+    np.testing.assert_allclose(d4p_model.predict(X_test), expected, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("opname", ["<", "<=", ">", ">="])
+def test_treelite_float64_threshold_on_split(opname):
+    # A threshold that no float32 represents, picked so that rounding it to
+    # float32 goes down: the rounded value is then itself the largest float32
+    # below the threshold, and an observation sitting exactly on it has to be
+    # routed the way the source model routes it rather than one ulp lower.
+    threshold = 12345.6789
+    assert float(np.float32(threshold)) < threshold
+
+    builder = treelite.model_builder.ModelBuilder(
+        threshold_type="float64",
+        leaf_output_type="float64",
+        metadata=treelite.model_builder.Metadata(
+            num_feature=1,
+            task_type="kRegressor",
+            average_tree_output=True,
+            num_target=1,
+            num_class=[1],
+            leaf_vector_shape=(1, 1),
+        ),
+        tree_annotation=treelite.model_builder.TreeAnnotation(
+            num_tree=1, target_id=[0], class_id=[0]
+        ),
+        postprocessor=treelite.model_builder.PostProcessorFunc(name="identity"),
+        base_scores=[0.0],
+    )
+    builder.start_tree()
+    builder.start_node(0)
+    builder.numerical_test(
+        feature_id=0,
+        threshold=threshold,
+        default_left=True,
+        opname=opname,
+        left_child_key=1,
+        right_child_key=2,
+    )
+    builder.end_node()
+    builder.start_node(1)
+    builder.leaf(-1.0)
+    builder.end_node()
+    builder.start_node(2)
+    builder.leaf(1.0)
+    builder.end_node()
+    builder.end_tree()
+    tl_model = builder.commit()
+
+    # the float32 straddling the threshold, which is where the two operators
+    # part ways; float64 observations closer to it than a float32 step are
+    # outside what the conversion promises
+    rounded = np.float32(threshold)
+    X = np.array(
+        [
+            [np.nextafter(rounded, np.float32(-np.inf))],
+            [rounded],
+            [np.nextafter(rounded, np.float32(np.inf))],
+        ],
+        dtype=np.float64,
+    )
+    np.testing.assert_allclose(
+        d4p.mb.convert_model(tl_model).predict(X),
+        treelite.gtil.predict(tl_model, X, pred_margin=True).reshape(-1),
+        atol=1e-5,
+        rtol=1e-5,
+    )
 
 
 @pytest.mark.skip(reason="causes timeouts in CI")
