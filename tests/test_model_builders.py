@@ -1748,72 +1748,6 @@ def test_predictions_of_observations_on_split_thresholds(booster_kind, from_tree
     np.testing.assert_allclose(d4p_model.predict(X_test), expected, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.parametrize("opname", ["<", "<=", ">", ">="])
-def test_treelite_float64_threshold_on_split(opname):
-    # A threshold that no float32 represents, picked so that rounding it to
-    # float32 goes down: the rounded value is then itself the largest float32
-    # below the threshold, and an observation sitting exactly on it has to be
-    # routed the way the source model routes it rather than one ulp lower.
-    threshold = 12345.6789
-    assert float(np.float32(threshold)) < threshold
-
-    builder = treelite.model_builder.ModelBuilder(
-        threshold_type="float64",
-        leaf_output_type="float64",
-        metadata=treelite.model_builder.Metadata(
-            num_feature=1,
-            task_type="kRegressor",
-            average_tree_output=True,
-            num_target=1,
-            num_class=[1],
-            leaf_vector_shape=(1, 1),
-        ),
-        tree_annotation=treelite.model_builder.TreeAnnotation(
-            num_tree=1, target_id=[0], class_id=[0]
-        ),
-        postprocessor=treelite.model_builder.PostProcessorFunc(name="identity"),
-        base_scores=[0.0],
-    )
-    builder.start_tree()
-    builder.start_node(0)
-    builder.numerical_test(
-        feature_id=0,
-        threshold=threshold,
-        default_left=True,
-        opname=opname,
-        left_child_key=1,
-        right_child_key=2,
-    )
-    builder.end_node()
-    builder.start_node(1)
-    builder.leaf(-1.0)
-    builder.end_node()
-    builder.start_node(2)
-    builder.leaf(1.0)
-    builder.end_node()
-    builder.end_tree()
-    tl_model = builder.commit()
-
-    # the float32 straddling the threshold, which is where the two operators
-    # part ways; float64 observations closer to it than a float32 step are
-    # outside what the conversion promises
-    rounded = np.float32(threshold)
-    X = np.array(
-        [
-            [np.nextafter(rounded, np.float32(-np.inf))],
-            [rounded],
-            [np.nextafter(rounded, np.float32(np.inf))],
-        ],
-        dtype=np.float64,
-    )
-    np.testing.assert_allclose(
-        d4p.mb.convert_model(tl_model).predict(X),
-        treelite.gtil.predict(tl_model, X, pred_margin=True).reshape(-1),
-        atol=1e-5,
-        rtol=1e-5,
-    )
-
-
 @pytest.mark.skip(reason="causes timeouts in CI")
 @pytest.mark.parametrize("from_treelite", [False, True])
 def test_unsupported_multiclass(from_treelite):
@@ -1995,8 +1929,12 @@ def test_treelite_unsupported():
 # These aren't typically produced by the main libraries targeted by
 # treelite, but can still be specified to be like this when constructing
 # a model through their model builder.
+# 12345.6789 is not representable as a float32 and rounds down to one, which
+# is what tells a correctly converted exclusive split from one that steps a
+# further ulp down; 5.0 is representable and reproduces the plain case
+@pytest.mark.parametrize("threshold", [5.0, 12345.6789])
 @pytest.mark.parametrize("opname", [">", ">=", "<", "<="])
-def test_treelite_uncommon(opname):
+def test_treelite_uncommon(opname, threshold):
     # Taken from their example with a modified op:
     # https://treelite.readthedocs.io/en/latest/tutorials/builder.html
     builder = treelite.model_builder.ModelBuilder(
@@ -2020,7 +1958,7 @@ def test_treelite_uncommon(opname):
     builder.start_node(0)
     builder.numerical_test(
         feature_id=0,
-        threshold=5.0,
+        threshold=threshold,
         default_left=True,
         opname=opname,
         left_child_key=1,
@@ -2051,33 +1989,37 @@ def test_treelite_uncommon(opname):
     tl_model = builder.commit()
     d4p_model = d4p.mb.convert_model(tl_model)
 
+    # observations for the first feature, expressed relative to its threshold;
+    # the one sitting on the split is the float32 of it, as a float64 nearer
+    # than a float32 step is outside what the conversion promises
+    lo, on, hi = threshold - 5.0, float(np.float32(threshold)), threshold + 5.0
     X = np.array(
         [
-            [0.0, 0.0, -5.0],
-            [0.0, 0.0, -2.0],
-            [0.0, 0.0, 1.0],
-            [0.0, 5.0, -5.0],
-            [0.0, 5.0, -2.0],
-            [0.0, 5.0, 1.0],
-            [10.0, 0.0, -5.0],
-            [10.0, 0.0, -2.0],
-            [10.0, 0.0, 1.0],
-            [10.0, 5.0, -5.0],
-            [10.0, 5.0, -2.0],
-            [10.0, 5.0, 1.0],
+            [lo, 0.0, -5.0],
+            [lo, 0.0, -2.0],
+            [lo, 0.0, 1.0],
+            [lo, 5.0, -5.0],
+            [lo, 5.0, -2.0],
+            [lo, 5.0, 1.0],
+            [hi, 0.0, -5.0],
+            [hi, 0.0, -2.0],
+            [hi, 0.0, 1.0],
+            [hi, 5.0, -5.0],
+            [hi, 5.0, -2.0],
+            [hi, 5.0, 1.0],
             # observations sitting exactly on each threshold, which are the
             # only ones that tell the strict operators from the inclusive ones
-            [5.0, 0.0, -3.0],
-            [5.0, 0.0, 1.0],
-            [0.0, 0.0, -3.0],
-            [10.0, 0.0, -3.0],
+            [on, 0.0, -3.0],
+            [on, 0.0, 1.0],
+            [lo, 0.0, -3.0],
+            [hi, 0.0, -3.0],
             # observations that take a default branch, which is the other half
             # of what swapping the children of a '>' or '>=' split has to get
             # right, as the default direction gets swapped along with them
             [np.nan, 0.0, -5.0],
             [np.nan, 0.0, 1.0],
-            [0.0, 0.0, np.nan],
-            [10.0, 0.0, np.nan],
+            [lo, 0.0, np.nan],
+            [hi, 0.0, np.nan],
         ]
     )
     np.testing.assert_almost_equal(

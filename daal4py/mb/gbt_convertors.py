@@ -18,7 +18,6 @@ import json
 import warnings
 from collections import deque
 from copy import deepcopy
-from functools import lru_cache
 from tempfile import NamedTemporaryFile
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
@@ -106,10 +105,6 @@ class CatBoostModelData:
         return int(nan_mode.lower() == "min")
 
 
-_NEG_INF_FLOAT32 = np.float32(-np.inf)
-
-
-@lru_cache(maxsize=4096)
 def _get_split_threshold(value: float, equal_goes_left: bool) -> np.float32:
     """Get the float32 threshold for oneDAL's 'x <= threshold goes left' rule
 
@@ -117,7 +112,6 @@ def _get_split_threshold(value: float, equal_goes_left: bool) -> np.float32:
     the largest one strictly below it for an exclusive one, so that every
     float32 observation reaches the child the source model sends it to. Float64
     observations falling between the returned threshold and 'value' do not.
-    A forest's splits repeat thresholds heavily, hence the cache.
     """
     # rounding to float32 can go either way, and a rounded threshold that landed
     # on the wrong side of 'value' would take in observations that the split it
@@ -126,25 +120,11 @@ def _get_split_threshold(value: float, equal_goes_left: bool) -> np.float32:
     rounded = np.float32(value)
     if float(rounded) <= value if equal_goes_left else float(rounded) < value:
         return rounded
-    return np.nextafter(rounded, _NEG_INF_FLOAT32)
+    return np.nextafter(rounded, np.float32(-np.inf))
 
 
 class Node:
     """Helper class holding Tree Node information"""
-
-    __slots__ = (
-        "cover",
-        "is_leaf",
-        "default_left",
-        "__feature",
-        "value",
-        "equal_goes_left",
-        "n_children",
-        "left_child",
-        "right_child",
-        "parent_id",
-        "position",
-    )
 
     def __init__(
         self,
