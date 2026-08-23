@@ -265,11 +265,12 @@ class Node:
     def get_split_threshold(self) -> np.float32:
         """Get the float32 threshold this node's split becomes in oneDAL
 
-        This node sends an observation left when 'x <op> value' holds, while
-        oneDAL sends it left when 'x <= threshold'. The threshold returned here
-        is the largest float32 that puts every float32 observation on the side
-        this node's own comparison puts it; float64 observations lying between
-        that threshold and 'value' are not preserved by the conversion.
+        Every source is normalised to send an observation left when 'x < value'
+        or 'x <= value' holds, whichever 'split_op' names, while oneDAL sends it
+        left when 'x <= threshold'. The threshold returned here is the largest
+        float32 that puts every float32 observation on the side this node's own
+        comparison puts it; float64 observations lying between that threshold
+        and 'value' are not preserved by the conversion.
         """
         # the rounded value can stand in for the threshold only while it still
         # falls on the left of this node's own split - otherwise it would take
