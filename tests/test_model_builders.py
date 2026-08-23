@@ -1626,38 +1626,38 @@ def test_model_from_booster():
 
 
 @pytest.mark.parametrize(
-    "value,equal_goes_left,expected",
+    "value,split_op,expected",
     [
         # a threshold that is exactly representable as a float32 only needs to
         # be stepped down when an observation equal to it belongs on the right
-        (0.5, False, 0.4999999701976776),
-        (0.5, True, 0.5),
+        (0.5, "<", 0.4999999701976776),
+        (0.5, "<=", 0.5),
         # when rounding to float32 goes up, the rounded threshold would take in
         # observations that the model leaves out, so both splits step down
-        (0.1, False, 0.09999999403953552),
-        (0.1, True, 0.09999999403953552),
-        (-12345.6789, False, -12345.6796875),
-        (-12345.6789, True, -12345.6796875),
+        (0.1, "<", 0.09999999403953552),
+        (0.1, "<=", 0.09999999403953552),
+        (-12345.6789, "<", -12345.6796875),
+        (-12345.6789, "<=", -12345.6796875),
         # when it goes down, the rounded threshold already sits below the one it
         # came from, so it excludes exactly what the model excludes and both
         # splits keep it; stepping down again would push observations that
         # belong on the left over to the right
-        (-0.1, False, -0.10000000149011612),
-        (-0.1, True, -0.10000000149011612),
-        (12345.6789, False, 12345.6787109375),
-        (12345.6789, True, 12345.6787109375),
-        (1e10 + 0.5, False, 10000000000.0),
-        (1e10 + 0.5, True, 10000000000.0),
+        (-0.1, "<", -0.10000000149011612),
+        (-0.1, "<=", -0.10000000149011612),
+        (12345.6789, "<", 12345.6787109375),
+        (12345.6789, "<=", 12345.6787109375),
+        (1e10 + 0.5, "<", 10000000000.0),
+        (1e10 + 0.5, "<=", 10000000000.0),
     ],
 )
-def test_split_threshold(value, equal_goes_left, expected):
+def test_split_threshold(value, split_op, expected):
     node = gbt_convertors.Node(
         cover=1.0,
         is_leaf=False,
         default_left=False,
         feature=0,
         value=value,
-        equal_goes_left=equal_goes_left,
+        split_op=split_op,
     )
     assert float(node.get_split_threshold()) == expected
 

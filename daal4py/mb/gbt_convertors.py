@@ -105,24 +105,6 @@ class CatBoostModelData:
         return int(nan_mode.lower() == "min")
 
 
-def _get_split_threshold(value: float, equal_goes_left: bool) -> np.float32:
-    """Get the float32 threshold for oneDAL's 'x <= threshold goes left' rule
-
-    This is the largest float32 not above 'value' for an inclusive split, and
-    the largest one strictly below it for an exclusive one, so that every
-    float32 observation reaches the child the source model sends it to. Float64
-    observations falling between the returned threshold and 'value' do not.
-    """
-    # rounding to float32 can go either way, and a rounded threshold that landed
-    # on the wrong side of 'value' would take in observations that the split it
-    # came from routes the other way, so it is usable as it is only while it
-    # still satisfies that split's own comparison against 'value'
-    rounded = np.float32(value)
-    if float(rounded) <= value if equal_goes_left else float(rounded) < value:
-        return rounded
-    return np.nextafter(rounded, np.float32(-np.inf))
-
-
 class Node:
     """Helper class holding Tree Node information"""
 
@@ -133,7 +115,7 @@ class Node:
         default_left: bool,
         feature: int,
         value: float,
-        equal_goes_left: bool,
+        split_op: Optional[str] = None,
         n_children: int = 0,
         left_child: "Optional[Node]" = None,
         right_child: "Optional[Node]" = None,
@@ -145,7 +127,7 @@ class Node:
         self.default_left = default_left
         self.__feature = feature
         self.value = value
-        self.equal_goes_left = equal_goes_left
+        self.split_op = split_op
         self.n_children = n_children
         self.left_child = left_child
         self.right_child = right_child
@@ -186,9 +168,7 @@ class Node:
             default_left=default_left,
             feature=feature,
             value=value,
-            # XGBoost splits on 'x < threshold', so an observation equal to the
-            # threshold goes right
-            equal_goes_left=False,
+            split_op=None if is_leaf else "<",
             n_children=n_children,
             left_child=left_child,
             right_child=right_child,
@@ -228,9 +208,7 @@ class Node:
             default_left=tree.get("default_left", 0),
             feature=tree.get("split_feature"),
             value=value,
-            # every split reaching here compares with '<=', as checked above,
-            # so an observation equal to the threshold goes left
-            equal_goes_left=True,
+            split_op=None if is_leaf else "<=",
             n_children=n_children,
             left_child=left_child,
             right_child=right_child,
@@ -257,21 +235,20 @@ class Node:
             right_child = None
 
         value = this_node["leaf_value"] if is_leaf else this_node["threshold"]
-        equal_goes_left = False
+        split_op = None
         if not is_leaf:
-            comp = this_node["comparison_op"]
-            if comp in (">", ">="):
+            split_op = this_node["comparison_op"]
+            if split_op in (">", ">="):
                 # oneDAL always keeps the lower values in the left child, so the
                 # children are swapped, which turns 'x > t' into 'x <= t' and
                 # 'x >= t' into 'x < t'
                 left_child, right_child = right_child, left_child
                 default_left = not default_left
-                comp = "<=" if comp == ">" else "<"
-            elif comp not in ("<", "<="):
+                split_op = "<=" if split_op == ">" else "<"
+            elif split_op not in ("<", "<="):
                 raise TypeError(
-                    f"Model to convert contains unsupported split type: {comp}."
+                    f"Model to convert contains unsupported split type: {split_op}."
                 )
-            equal_goes_left = comp == "<="
 
         return Node(
             cover=this_node.get("sum_hess", 0.0),
@@ -279,15 +256,33 @@ class Node:
             default_left=default_left,
             feature=this_node.get("split_feature_id"),
             value=value,
-            equal_goes_left=equal_goes_left,
+            split_op=split_op,
             n_children=n_children,
             left_child=left_child,
             right_child=right_child,
         )
 
     def get_split_threshold(self) -> np.float32:
-        """Get the float32 threshold this node's split becomes in oneDAL"""
-        return _get_split_threshold(self.value, self.equal_goes_left)
+        """Get the float32 threshold this node's split becomes in oneDAL
+
+        This node sends an observation left when 'x <op> value' holds, while
+        oneDAL sends it left when 'x <= threshold'. The threshold returned here
+        is the largest float32 that puts every float32 observation on the side
+        this node's own comparison puts it; float64 observations lying between
+        that threshold and 'value' are not preserved by the conversion.
+        """
+        # the rounded value can stand in for the threshold only while it still
+        # falls on the left of this node's own split - otherwise it would take
+        # in observations that the split sends right
+        rounded = np.float32(self.value)
+        rounded_goes_left = (
+            float(rounded) <= self.value
+            if self.split_op == "<="
+            else float(rounded) < self.value
+        )
+        if rounded_goes_left:
+            return rounded
+        return np.nextafter(rounded, np.float32(-np.inf))
 
     def get_children(self) -> "Optional[Tuple[Node, Node]]":
         if not self.left_child or not self.right_child:
